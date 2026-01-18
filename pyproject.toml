@@ -1,0 +1,4 @@
+[project]
+name = "comfyui-segment-anything-a100"
+version = "0.9.1"
+description = "A100 optimized Segment Anything nodes for ComfyUI"
