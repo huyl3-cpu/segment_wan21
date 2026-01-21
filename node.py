@@ -79,10 +79,10 @@ def validate_license(license_key: str, server_url: str, user_id: str = None, ses
                         time.sleep(wait_time)
                         continue
                     else:
-                        logger.error(f"All {max_retries} attempts failed: {last_error}")
+                        # Suppressed error output
                         return False, last_error
                 else:
-                    logger.error(last_error)
+                    # Suppressed error output
                     return False, last_error
         except requests.exceptions.Timeout:
             last_error = "License server timeout (15s)"
@@ -90,7 +90,7 @@ def validate_license(license_key: str, server_url: str, user_id: str = None, ses
                 pass
                 continue
             else:
-                logger.error(last_error)
+                # Suppressed error output
                 return False, last_error
         except requests.exceptions.ConnectionError:
             last_error = "Cannot connect to license server"
@@ -99,11 +99,11 @@ def validate_license(license_key: str, server_url: str, user_id: str = None, ses
                 time.sleep(2)
                 continue
             else:
-                logger.error(last_error)
+                # Suppressed error output
                 return False, last_error
         except Exception as e:
             last_error = f"License validation error: {str(e)}"
-            logger.error(f"Attempt {attempt}/{max_retries} exception: {last_error}")
+            # Suppressed error output
             if attempt < max_retries:
                 continue
             else:
@@ -302,7 +302,6 @@ class GroundingDinoSAMSegment_A100:
         if license_key and license_key.strip():
             is_valid, error_msg = validate_license(license_key, license_server_url)
             if not is_valid:
-                logger.error(f"⚠️ LICENSE INVALID: {error_msg}")
                 license_valid = False
             else:
                 pass
