@@ -223,11 +223,17 @@ def groundingdino_predict_batch(dino_model, image_pil_list, prompt, threshold, d
     device = comfy.model_management.get_torch_device()
     samples = nested_tensor_from_tensor_list(tensors_list).to(device)
     samples = FastNestedTensor(samples.tensors.to(dtype=dtype), samples.mask)
+    # Determine autocast dtype for mixed precision
+    autocast_dtype = dtype if dtype != torch.float32 else None
     caption = prompt.lower().strip()
     if not caption.endswith("."): caption = caption + "."
     captions_batch = [caption] * len(image_pil_list)
     with torch.no_grad():
-        outputs = dino_model(samples, captions=captions_batch)
+        if autocast_dtype is not None and torch.cuda.is_available():
+            with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                outputs = dino_model(samples, captions=captions_batch)
+        else:
+            outputs = dino_model(samples, captions=captions_batch)
     prediction_logits = outputs["pred_logits"].sigmoid()
     prediction_boxes = outputs["pred_boxes"]
     batch_boxes_result = []
@@ -279,7 +285,8 @@ class GroundingDinoSAMSegment_A100:
                 "image": ('IMAGE', {}),
                 "prompt": ("STRING", {}),
                 "threshold": ("FLOAT", {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01}),
-                "batch_size": ("INT", {"default": 8, "min": 1, "max": 64, "step": 1}),
+                "batch_size": ("INT", {"default": 32, "min": 1, "max": 128, "step": 1, "tooltip": "Batch size for processing. A100 80GB can handle 32-64."}),
+                "precision": (["bf16", "fp16", "fp32"], {"default": "bf16", "tooltip": "Computation precision. bf16 recommended for A100."}),
             },
             "optional": {
                 "license_key": ("STRING", {
@@ -293,7 +300,7 @@ class GroundingDinoSAMSegment_A100:
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
     DISPLAY_NAME = "SamSegment"
-    def main(self, sam_model_name, grounding_dino_model_name, image, prompt, threshold, batch_size, target_resolution=1024, precision="fp32", license_key="", license_server_url="https://license.xgroup-service.com"):
+    def main(self, sam_model_name, grounding_dino_model_name, image, prompt, threshold, batch_size, precision="bf16", target_resolution=1024, license_key="", license_server_url="https://license.xgroup-service.com"):
         sam_model = load_sam_model(sam_model_name)
         grounding_dino_model = load_groundingdino_model(grounding_dino_model_name)
         total_images = image.shape[0]
@@ -331,7 +338,11 @@ class GroundingDinoSAMSegment_A100:
             chunk_images = image[i:end_idx]
             try:
                 sam_input_batch = prepare_sam_batch(chunk_images, target_length=target_resolution, dtype=target_dtype)
-                batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
+                if target_dtype != torch.float32 and torch.cuda.is_available():
+                    with torch.cuda.amp.autocast(dtype=target_dtype):
+                        batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
+                else:
+                    batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
                 original_size = (chunk_images.shape[1], chunk_images.shape[2])
                 input_size = (sam_input_batch.shape[2], sam_input_batch.shape[3])
                 chunk_pil_list = []
@@ -355,19 +366,28 @@ class GroundingDinoSAMSegment_A100:
                     predictor.set_precomputed_features(curr_feat, curr_interm, original_size, input_size)
                     transformed_boxes = predictor.transform.apply_boxes_torch(boxes, original_size)
                     transformed_boxes = transformed_boxes.to(device)
-                    masks, _, _ = predictor.predict_torch(
-                        point_coords=None,
-                        point_labels=None,
-                        boxes=transformed_boxes,
-                        multimask_output=False
-                    )
+                    if target_dtype != torch.float32 and torch.cuda.is_available():
+                        with torch.cuda.amp.autocast(dtype=target_dtype):
+                            masks, _, _ = predictor.predict_torch(
+                                point_coords=None,
+                                point_labels=None,
+                                boxes=transformed_boxes,
+                                multimask_output=False
+                            )
+                    else:
+                        masks, _, _ = predictor.predict_torch(
+                            point_coords=None,
+                            point_labels=None,
+                            boxes=transformed_boxes,
+                            multimask_output=False
+                        )
                     final_mask = torch.any(masks, dim=0).float().cpu()
                     res_masks.append(final_mask)
                     mask_3d = final_mask[0].unsqueeze(-1).repeat(1, 1, 3)
                     masked_image = curr_image_tensor * mask_3d
                     res_images.append(masked_image.unsqueeze(0))
                 del batch_features, batch_interm, sam_input_batch
-                if (batch_idx % 5 == 0 or batch_idx == total_batches) and torch.cuda.is_available():
+                if (batch_idx % 20 == 0 or batch_idx == total_batches) and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 i = end_idx
             except torch.cuda.OutOfMemoryError as e:
