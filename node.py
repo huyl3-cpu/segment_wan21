@@ -320,9 +320,7 @@ class GroundingDinoSAMSegment_A100:
             "bf16": torch.bfloat16
         }
         target_dtype = dtype_map.get(precision, torch.float32)
-        if precision != "fp32" and torch.cuda.is_available():
-            sam_model = sam_model.to(dtype=target_dtype)
-            grounding_dino_model = grounding_dino_model.to(dtype=target_dtype)
+        use_autocast = precision != "fp32" and torch.cuda.is_available()
         start_time = time.time()
         total_batches = (total_images + batch_size - 1) // batch_size
         sam_is_hq = False
@@ -332,17 +330,16 @@ class GroundingDinoSAMSegment_A100:
         current_batch_size = batch_size
         i = 0
         batch_idx = 0
+        # Use a single autocast context for the entire loop to avoid dtype mismatches
+        autocast_ctx = torch.cuda.amp.autocast(dtype=target_dtype) if use_autocast else torch.no_grad()
         while i < total_images:
             batch_idx += 1
             end_idx = min(i + current_batch_size, total_images)
             chunk_images = image[i:end_idx]
             try:
-                sam_input_batch = prepare_sam_batch(chunk_images, target_length=target_resolution, dtype=target_dtype)
-                if target_dtype != torch.float32 and torch.cuda.is_available():
-                    with torch.cuda.amp.autocast(dtype=target_dtype):
-                        batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
-                else:
-                    batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
+              with autocast_ctx:
+                sam_input_batch = prepare_sam_batch(chunk_images, target_length=target_resolution, dtype=torch.float32)
+                batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
                 original_size = (chunk_images.shape[1], chunk_images.shape[2])
                 input_size = (sam_input_batch.shape[2], sam_input_batch.shape[3])
                 chunk_pil_list = []
@@ -350,7 +347,7 @@ class GroundingDinoSAMSegment_A100:
                     chunk_pil_list.append(
                         Image.fromarray(np.clip(255. * chunk_images[j].cpu().numpy(), 0, 255).astype(np.uint8)).convert('RGB')
                     )
-                batch_boxes = groundingdino_predict_batch(grounding_dino_model, chunk_pil_list, prompt, threshold, dtype=target_dtype)
+                batch_boxes = groundingdino_predict_batch(grounding_dino_model, chunk_pil_list, prompt, threshold, dtype=torch.float32)
                 for idx_in_batch in range(chunk_images.shape[0]):
                     curr_image_tensor = chunk_images[idx_in_batch]
                     boxes = batch_boxes[idx_in_batch]
@@ -366,21 +363,12 @@ class GroundingDinoSAMSegment_A100:
                     predictor.set_precomputed_features(curr_feat, curr_interm, original_size, input_size)
                     transformed_boxes = predictor.transform.apply_boxes_torch(boxes, original_size)
                     transformed_boxes = transformed_boxes.to(device)
-                    if target_dtype != torch.float32 and torch.cuda.is_available():
-                        with torch.cuda.amp.autocast(dtype=target_dtype):
-                            masks, _, _ = predictor.predict_torch(
-                                point_coords=None,
-                                point_labels=None,
-                                boxes=transformed_boxes,
-                                multimask_output=False
-                            )
-                    else:
-                        masks, _, _ = predictor.predict_torch(
-                            point_coords=None,
-                            point_labels=None,
-                            boxes=transformed_boxes,
-                            multimask_output=False
-                        )
+                    masks, _, _ = predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False
+                    )
                     final_mask = torch.any(masks, dim=0).float().cpu()
                     res_masks.append(final_mask)
                     mask_3d = final_mask[0].unsqueeze(-1).repeat(1, 1, 3)
