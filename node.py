@@ -330,16 +330,18 @@ class GroundingDinoSAMSegment_A100:
         current_batch_size = batch_size
         i = 0
         batch_idx = 0
-        # Use a single autocast context for the entire loop to avoid dtype mismatches
-        autocast_ctx = torch.cuda.amp.autocast(dtype=target_dtype) if use_autocast else torch.no_grad()
         while i < total_images:
             batch_idx += 1
             end_idx = min(i + current_batch_size, total_images)
             chunk_images = image[i:end_idx]
             try:
-              with autocast_ctx:
                 sam_input_batch = prepare_sam_batch(chunk_images, target_length=target_resolution, dtype=torch.float32)
-                batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
+                # Autocast only for SAM encoder (safe, no gradient checkpointing)
+                if use_autocast:
+                    with torch.cuda.amp.autocast(dtype=target_dtype):
+                        batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
+                else:
+                    batch_features, batch_interm = predictor.get_image_features(sam_input_batch)
                 original_size = (chunk_images.shape[1], chunk_images.shape[2])
                 input_size = (sam_input_batch.shape[2], sam_input_batch.shape[3])
                 chunk_pil_list = []
@@ -347,6 +349,7 @@ class GroundingDinoSAMSegment_A100:
                     chunk_pil_list.append(
                         Image.fromarray(np.clip(255. * chunk_images[j].cpu().numpy(), 0, 255).astype(np.uint8)).convert('RGB')
                     )
+                # GroundingDINO stays in fp32 (has gradient checkpointing that conflicts with autocast)
                 batch_boxes = groundingdino_predict_batch(grounding_dino_model, chunk_pil_list, prompt, threshold, dtype=torch.float32)
                 for idx_in_batch in range(chunk_images.shape[0]):
                     curr_image_tensor = chunk_images[idx_in_batch]
@@ -363,12 +366,22 @@ class GroundingDinoSAMSegment_A100:
                     predictor.set_precomputed_features(curr_feat, curr_interm, original_size, input_size)
                     transformed_boxes = predictor.transform.apply_boxes_torch(boxes, original_size)
                     transformed_boxes = transformed_boxes.to(device)
-                    masks, _, _ = predictor.predict_torch(
-                        point_coords=None,
-                        point_labels=None,
-                        boxes=transformed_boxes,
-                        multimask_output=False
-                    )
+                    # Autocast only for SAM decoder (safe, simple forward pass)
+                    if use_autocast:
+                        with torch.cuda.amp.autocast(dtype=target_dtype):
+                            masks, _, _ = predictor.predict_torch(
+                                point_coords=None,
+                                point_labels=None,
+                                boxes=transformed_boxes,
+                                multimask_output=False
+                            )
+                    else:
+                        masks, _, _ = predictor.predict_torch(
+                            point_coords=None,
+                            point_labels=None,
+                            boxes=transformed_boxes,
+                            multimask_output=False
+                        )
                     final_mask = torch.any(masks, dim=0).float().cpu()
                     res_masks.append(final_mask)
                     mask_3d = final_mask[0].unsqueeze(-1).repeat(1, 1, 3)
