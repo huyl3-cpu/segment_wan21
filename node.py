@@ -24,6 +24,156 @@ import glob
 logger = logging.getLogger('comfyui_segment_anything_a100')
 _DEBUG_LICENSE = os.environ.get("LICENSE_DEBUG", "0") == "1"
 _session_cache = {}
+
+# Attention backend integration (SDPA / Flash Attention / SageAttention)
+_HAS_SAGE_ATTN = False
+try:
+    from sageattention import sageattn
+    _HAS_SAGE_ATTN = True
+    logger.info("SageAttention available for SAM ViT encoder")
+except ImportError:
+    pass
+
+_HAS_FLASH_ATTN = False
+try:
+    from flash_attn import flash_attn_func
+    _HAS_FLASH_ATTN = True
+    logger.info("Flash Attention available for SAM ViT encoder")
+except ImportError:
+    pass
+
+_sam_original_attn_forward = None
+_current_attn_mode = "pytorch"
+
+def _make_sdpa_attn_forward():
+    """Create SDPA-based forward for SAM ViT Attention.
+    Uses F.scaled_dot_product_attention which auto-dispatches to
+    Flash Attention / Memory Efficient Attention backends.
+    Handles relative position embeddings by computing attn_bias."""
+    from segment_anything.modeling.image_encoder import add_decomposed_rel_pos, get_rel_pos
+    def sdpa_attn_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = x.shape
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # (B, num_heads, H*W, head_dim)
+
+        if self.use_rel_pos:
+            # Compute rel_pos bias and pass as attn_mask to SDPA
+            # rel_pos needs (B*nHead, H*W, C) format for add_decomposed_rel_pos
+            head_dim = q.shape[-1]
+            q_for_bias = q.reshape(B * self.num_heads, H * W, head_dim)
+            
+            # Build the bias tensor
+            attn_bias = torch.zeros(B * self.num_heads, H * W, H * W, 
+                                    dtype=q.dtype, device=q.device)
+            attn_bias = add_decomposed_rel_pos(attn_bias, q_for_bias, 
+                                                self.rel_pos_h, self.rel_pos_w, 
+                                                (H, W), (H, W))
+            # Reshape bias to (B, num_heads, H*W, H*W) for SDPA
+            attn_bias = attn_bias.view(B, self.num_heads, H * W, H * W)
+            
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v)
+
+        x = x.transpose(1, 2).reshape(B, H, W, -1)
+        x = self.proj(x)
+        return x
+    return sdpa_attn_forward
+
+def _make_sageattn_forward():
+    """Create SageAttention forward. Falls back to naive for rel_pos blocks."""
+    from segment_anything.modeling.image_encoder import add_decomposed_rel_pos
+    def sage_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = x.shape
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        if self.use_rel_pos:
+            # SageAttention doesn't support attn bias → fallback to naive
+            q_flat = q.reshape(B * self.num_heads, H * W, -1)
+            k_flat = k.reshape(B * self.num_heads, H * W, -1)
+            v_flat = v.reshape(B * self.num_heads, H * W, -1)
+            attn = (q_flat * self.scale) @ k_flat.transpose(-2, -1)
+            attn = add_decomposed_rel_pos(attn, q_flat, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            attn = attn.softmax(dim=-1)
+            x = (attn @ v_flat).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        else:
+            x = sageattn(q, k, v, is_causal=False)
+            x = x.transpose(1, 2).reshape(B, H, W, -1)
+
+        x = self.proj(x)
+        return x
+    return sage_forward
+
+def _make_flash_attn_forward():
+    """Create Flash Attention forward using flash-attn package directly.
+    flash_attn_func expects (B, seq_len, num_heads, head_dim) format.
+    For rel_pos blocks, falls back to SDPA with bias."""
+    from segment_anything.modeling.image_encoder import add_decomposed_rel_pos
+    def flash_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = x.shape
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1)
+        q, k, v = qkv.unbind(2)  # (B, H*W, num_heads, head_dim)
+
+        if self.use_rel_pos:
+            # flash_attn doesn't support arbitrary attn bias
+            # Use SDPA with bias as fallback (still optimized)
+            head_dim = q.shape[-1]
+            q_t = q.transpose(1, 2)  # (B, num_heads, H*W, head_dim)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            q_for_bias = q_t.reshape(B * self.num_heads, H * W, head_dim)
+            attn_bias = torch.zeros(B * self.num_heads, H * W, H * W,
+                                    dtype=q.dtype, device=q.device)
+            attn_bias = add_decomposed_rel_pos(attn_bias, q_for_bias,
+                                                self.rel_pos_h, self.rel_pos_w,
+                                                (H, W), (H, W))
+            attn_bias = attn_bias.view(B, self.num_heads, H * W, H * W)
+            x = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias)
+            x = x.transpose(1, 2).reshape(B, H, W, -1)
+        else:
+            # Direct flash_attn: (B, seq_len, num_heads, head_dim)
+            x = flash_attn_func(q, k, v, causal=False)
+            x = x.reshape(B, H, W, -1)
+
+        x = self.proj(x)
+        return x
+    return flash_forward
+
+def enable_optimized_attention(mode="sdpa"):
+    """Monkey-patch SAM ViT Attention with optimized backend."""
+    global _sam_original_attn_forward, _current_attn_mode
+    try:
+        from segment_anything.modeling.image_encoder import Attention as SAMAttention
+        if _sam_original_attn_forward is None:
+            _sam_original_attn_forward = SAMAttention.forward
+        
+        if mode == "sdpa":
+            SAMAttention.forward = _make_sdpa_attn_forward()
+            _current_attn_mode = "sdpa"
+            logger.info("SDPA enabled for SAM ViT (auto Flash/MemEfficient)")
+        elif mode == "flash_attn":
+            SAMAttention.forward = _make_flash_attn_forward()
+            _current_attn_mode = "flash_attn"
+            logger.info("Flash Attention enabled for SAM ViT (direct flash-attn package)")
+        elif mode == "sageattn":
+            SAMAttention.forward = _make_sageattn_forward()
+            _current_attn_mode = "sageattn"
+            logger.info("SageAttention enabled for SAM ViT (non-rel_pos blocks only)")
+    except Exception as e:
+        logger.warning(f"Failed to enable {mode} for SAM: {e}")
+
+def disable_optimized_attention():
+    """Restore original SAM ViT Attention."""
+    global _sam_original_attn_forward, _current_attn_mode
+    if _sam_original_attn_forward is not None:
+        try:
+            from segment_anything.modeling.image_encoder import Attention as SAMAttention
+            SAMAttention.forward = _sam_original_attn_forward
+            _sam_original_attn_forward = None
+            _current_attn_mode = "pytorch"
+        except Exception:
+            pass
 def validate_license(license_key: str, server_url: str, user_id: str = None, session_id: str = None, max_retries: int = 3) -> tuple[bool, str]:
     if not license_key or not license_key.strip():
         return False, "License key is empty"
@@ -287,6 +437,7 @@ class GroundingDinoSAMSegment_A100:
                 "threshold": ("FLOAT", {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01}),
                 "batch_size": ("INT", {"default": 32, "min": 1, "max": 128, "step": 1, "tooltip": "Batch size for processing. A100 80GB can handle 32-64."}),
                 "precision": (["bf16", "fp16", "fp32"], {"default": "bf16", "tooltip": "Computation precision. bf16 recommended for A100."}),
+                "attention_mode": (["pytorch", "sdpa", "flash_attn", "sageattn"], {"default": "pytorch", "tooltip": "Attention backend for SAM ViT. sdpa=auto Flash/MemEfficient, flash_attn=direct flash-attn package, sageattn=SageAttention."}),
             },
             "optional": {
                 "license_key": ("STRING", {
@@ -300,7 +451,19 @@ class GroundingDinoSAMSegment_A100:
     FUNCTION = "main"
     RETURN_TYPES = ("IMAGE", "MASK")
     DISPLAY_NAME = "SamSegment"
-    def main(self, sam_model_name, grounding_dino_model_name, image, prompt, threshold, batch_size, precision="bf16", target_resolution=1024, license_key="", license_server_url="https://license.xgroup-service.com"):
+    def main(self, sam_model_name, grounding_dino_model_name, image, prompt, threshold, batch_size, precision="bf16", attention_mode="pytorch", target_resolution=1024, license_key="", license_server_url="https://license.xgroup-service.com"):
+        # Enable/disable optimized attention based on widget
+        if attention_mode in ("sdpa", "flash_attn", "sageattn"):
+            actual_mode = attention_mode
+            if attention_mode == "sageattn" and not _HAS_SAGE_ATTN:
+                logger.warning("SageAttention not installed. pip install sageattention. Falling back to sdpa.")
+                actual_mode = "sdpa"
+            elif attention_mode == "flash_attn" and not _HAS_FLASH_ATTN:
+                logger.warning("flash-attn not installed. pip install flash-attn. Falling back to sdpa.")
+                actual_mode = "sdpa"
+            enable_optimized_attention(actual_mode)
+        else:
+            disable_optimized_attention()
         sam_model = load_sam_model(sam_model_name)
         grounding_dino_model = load_groundingdino_model(grounding_dino_model_name)
         total_images = image.shape[0]
@@ -399,6 +562,9 @@ class GroundingDinoSAMSegment_A100:
                     res_images.append(image[j].unsqueeze(0))
                 i = end_idx
         elapsed = time.time() - start_time
+        # Restore original attention after processing
+        if attention_mode in ("sdpa", "flash_attn", "sageattn"):
+            disable_optimized_attention()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
