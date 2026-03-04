@@ -27,9 +27,14 @@ def get_pretrained_language_model(text_encoder_type):
         prev_verbosity = transformers.logging.get_verbosity()
         transformers.logging.set_verbosity_error()
         logging.disable(logging.WARNING)
+        # Suppress tqdm progress bar (writes to stderr, not logging)
+        import sys, io
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
         try:
             model = BertModel.from_pretrained(text_encoder_type)
         finally:
+            sys.stderr = old_stderr
             transformers.logging.set_verbosity(prev_verbosity)
             logging.disable(logging.NOTSET)
         return model
