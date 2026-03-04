@@ -4,6 +4,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import torch
 import torch.nn.functional as F
 import numpy as np
+import scipy.ndimage
 from PIL import Image
 import logging
 import time
@@ -438,6 +439,11 @@ class GroundingDinoSAMSegment_A100:
                 "batch_size": ("INT", {"default": 32, "min": 1, "max": 128, "step": 1, "tooltip": "Batch size for processing. A100 80GB can handle 32-64."}),
                 "precision": (["bf16", "fp16", "fp32"], {"default": "bf16", "tooltip": "Computation precision. bf16 recommended for A100."}),
                 "attention_mode": (["pytorch", "sdpa", "flash_attn", "sageattn"], {"default": "pytorch", "tooltip": "Attention backend for SAM ViT. sdpa=auto Flash/MemEfficient, flash_attn=direct flash-attn package, sageattn=SageAttention."}),
+                "expand": ("INT", {"default": 0, "min": -512, "max": 512, "step": 1, "tooltip": "Grow Mask: expand (positive) or shrink (negative) the mask by pixels."}),
+                "tapered_corners": ("BOOLEAN", {"default": True, "tooltip": "Grow Mask: if True, corners are tapered (rounded). If False, corners are square."}),
+                "block_size": ("INT", {"default": 32, "min": 8, "max": 512, "step": 1, "tooltip": "Blockify Mask: size of blocks in pixels."}),
+                "blockify_device": (["cpu", "gpu"], {"default": "gpu", "tooltip": "Blockify Mask: device to use for processing."}),
+                "enable_active": ("BOOLEAN", {"default": True, "tooltip": "If True, runs segmentation normally. If False, outputs original image + black mask + '0'."}),
             },
             "optional": {
                 "license_key": ("STRING", {
@@ -449,9 +455,76 @@ class GroundingDinoSAMSegment_A100:
         }
     CATEGORY = "segment_anything"
     FUNCTION = "main"
-    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "active_status")
     DISPLAY_NAME = "SamSegment"
-    def main(self, sam_model_name, grounding_dino_model_name, image, prompt, threshold, batch_size, precision="bf16", attention_mode="pytorch", target_resolution=1024, license_key="", license_server_url="https://license.xgroup-service.com"):
+
+    @staticmethod
+    def _apply_grow_mask(mask_tensor, expand, tapered_corners):
+        if expand == 0:
+            return mask_tensor
+        c = 0 if tapered_corners else 1
+        kernel = np.array([[c, 1, c],
+                           [1, 1, 1],
+                           [c, 1, c]])
+        mask_np = mask_tensor.reshape((-1, mask_tensor.shape[-2], mask_tensor.shape[-1]))
+        out = []
+        for m in mask_np:
+            output = m.cpu().numpy()
+            for _ in range(abs(expand)):
+                if expand < 0:
+                    output = scipy.ndimage.grey_erosion(output, footprint=kernel)
+                else:
+                    output = scipy.ndimage.grey_dilation(output, footprint=kernel)
+            out.append(torch.from_numpy(output))
+        return torch.stack(out, dim=0)
+
+    @staticmethod
+    def _apply_blockify_mask(mask_tensor, block_size, device_str="gpu"):
+        processing_device = comfy.model_management.get_torch_device() if device_str == "gpu" else torch.device("cpu")
+        masks = mask_tensor.to(processing_device)
+        if masks.ndim == 2:
+            masks = masks.unsqueeze(0)
+        batch_size, height, width = masks.shape
+        result_masks = torch.zeros_like(masks)
+        for i in range(batch_size):
+            mask = masks[i]
+            mask_bool = mask > 0
+            if not mask_bool.any():
+                continue
+            y_indices = torch.nonzero(mask_bool.any(dim=1), as_tuple=True)[0]
+            x_indices = torch.nonzero(mask_bool.any(dim=0), as_tuple=True)[0]
+            if len(y_indices) == 0 or len(x_indices) == 0:
+                continue
+            y_min, y_max = y_indices[0], y_indices[-1]
+            x_min, x_max = x_indices[0], x_indices[-1]
+            bbox_width = x_max - x_min + 1
+            bbox_height = y_max - y_min + 1
+            w_divisions = max(1, bbox_width // block_size)
+            h_divisions = max(1, bbox_height // block_size)
+            w_slice = bbox_width // w_divisions
+            h_slice = bbox_height // h_divisions
+            y_coords = torch.arange(y_min, y_max + 1, device=processing_device).view(-1, 1)
+            x_coords = torch.arange(x_min, x_max + 1, device=processing_device).view(1, -1)
+            w_block_indices = ((x_coords - x_min) // w_slice).clamp(0, w_divisions - 1)
+            h_block_indices = ((y_coords - y_min) // h_slice).clamp(0, h_divisions - 1)
+            block_ids = h_block_indices * w_divisions + w_block_indices
+            mask_region = mask[y_min:y_max+1, x_min:x_max+1]
+            max_blocks = h_divisions * w_divisions
+            block_content = torch.zeros(max_blocks, device=processing_device)
+            block_content.scatter_add_(0, block_ids.flatten(), mask_region.flatten())
+            has_content = block_content > 0
+            block_mask = has_content[block_ids]
+            result_masks[i, y_min:y_max+1, x_min:x_max+1] = block_mask.float()
+        return result_masks.clamp(0, 1).cpu()
+
+    def main(self, sam_model_name, grounding_dino_model_name, image, prompt, threshold, batch_size, precision="bf16", attention_mode="pytorch", expand=0, tapered_corners=True, block_size=32, blockify_device="gpu", enable_active=True, target_resolution=1024, license_key="", license_server_url="https://license.xgroup-service.com"):
+        # If enable_active is False, return original image + black mask + "0"
+        if not enable_active:
+            total_images = image.shape[0]
+            black_mask = torch.zeros((total_images, image.shape[1], image.shape[2]), dtype=torch.float32)
+            return (image, black_mask, "0")
+
         # Enable/disable optimized attention based on widget
         if attention_mode in ("sdpa", "flash_attn", "sageattn"):
             actual_mode = attention_mode
@@ -493,7 +566,6 @@ class GroundingDinoSAMSegment_A100:
         current_batch_size = batch_size
         i = 0
         batch_idx = 0
-        # Use a single autocast context for the entire loop to avoid dtype mismatches
         autocast_ctx = torch.cuda.amp.autocast(dtype=target_dtype) if use_autocast else torch.no_grad()
         while i < total_images:
             batch_idx += 1
@@ -546,7 +618,6 @@ class GroundingDinoSAMSegment_A100:
                 if current_batch_size > 1:
                     current_batch_size = max(1, current_batch_size // 2)
                     total_batches = (total_images + current_batch_size - 1) // current_batch_size
-                    pass
                     batch_idx -= 1
                 else:
                     logger.error(f"CUDA OOM with batch_size=1. Cannot process image {i}. Skipping.")
@@ -562,14 +633,13 @@ class GroundingDinoSAMSegment_A100:
                     res_images.append(image[j].unsqueeze(0))
                 i = end_idx
         elapsed = time.time() - start_time
-        # Restore original attention after processing
         if attention_mode in ("sdpa", "flash_attn", "sageattn"):
             disable_optimized_attention()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         if len(res_images) == 0:
-            return (torch.zeros_like(image), torch.zeros((total_images, image.shape[1], image.shape[2])))
+            return (torch.zeros_like(image), torch.zeros((total_images, image.shape[1], image.shape[2])), "1")
         if not license_valid:
             pass
             fake_masks = torch.rand((total_images, image.shape[1], image.shape[2])) > 0.5
@@ -579,8 +649,21 @@ class GroundingDinoSAMSegment_A100:
                 fake_mask_3d = fake_masks[i].unsqueeze(-1).repeat(1, 1, 3)
                 fake_img = image[i] * fake_mask_3d
                 fake_images.append(fake_img.unsqueeze(0))
-            return (torch.cat(fake_images, dim=0), fake_masks)
-        return (torch.cat(res_images, dim=0), torch.cat(res_masks, dim=0))
+            return (torch.cat(fake_images, dim=0), fake_masks, "1")
+
+        # Combine masks and apply Grow Mask + Blockify Mask
+        combined_masks = torch.cat(res_masks, dim=0)
+        combined_masks = self._apply_grow_mask(combined_masks, expand, tapered_corners)
+        combined_masks = self._apply_blockify_mask(combined_masks, block_size, blockify_device)
+
+        # Recompute masked images with the processed mask
+        combined_images = []
+        for idx in range(combined_masks.shape[0]):
+            mask_3d = combined_masks[idx].unsqueeze(-1).repeat(1, 1, 3)
+            masked_img = image[idx] * mask_3d
+            combined_images.append(masked_img.unsqueeze(0))
+
+        return (torch.cat(combined_images, dim=0), combined_masks, "1")
 class InvertMask:
     @classmethod
     def INPUT_TYPES(cls): return {"required": {"mask": ("MASK",)}}
