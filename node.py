@@ -26,7 +26,7 @@ logger = logging.getLogger('comfyui_segment_anything_a100')
 _DEBUG_LICENSE = os.environ.get("LICENSE_DEBUG", "0") == "1"
 _session_cache = {}
 
-# Attention backend integration (SDPA / Flash Attention / SageAttention)
+# Attention backend integration (SDPA / Flash Attention / SageAttention / FP8 / sageattn3)
 _HAS_SAGE_ATTN = False
 try:
     from sageattention import sageattn
@@ -42,6 +42,66 @@ try:
     logger.info("Flash Attention available for SAM ViT encoder")
 except ImportError:
     pass
+
+# ── SageAttention FP8 (INT8 QK + FP8 PV) — Ampere SM80+ ────────────────────
+_HAS_SAGE_ATTN_FP8 = False
+_sage_fp8_kernel = None
+try:
+    from sageattention.core import sageattn_qk_int8_pv_fp8_cuda as _sage_fp8_ampere
+    try:
+        from sageattention.core import sageattn_qk_int8_pv_fp8_cuda_sm90 as _sage_fp8_sm90
+    except ImportError:
+        _sage_fp8_sm90 = _sage_fp8_ampere
+    if torch.cuda.is_available():
+        _sa_major, _sa_minor = torch.cuda.get_device_capability()
+        _sa_arch = _sa_major * 10 + _sa_minor
+        if _sa_arch >= 80:
+            _HAS_SAGE_ATTN_FP8 = True
+            _sage_fp8_kernel = _sage_fp8_sm90 if _sa_arch >= 90 else _sage_fp8_ampere
+            logger.info(f"SageAttention FP8 kernel available (SM{_sa_arch})")
+except (ImportError, AttributeError):
+    pass
+
+# ── sageattn3 (FP4 Blackwell SM120+ / FP8 fallback on older) ────────────────
+_HAS_SAGE_ATTN3 = False
+_sageattn3_func = None
+try:
+    from sageattn3 import sageattn3_blackwell as _sageattn3_import
+    _sageattn3_func = _sageattn3_import
+    _HAS_SAGE_ATTN3 = True
+    if torch.cuda.is_available():
+        _s3_major, _s3_minor = torch.cuda.get_device_capability()
+        _s3_arch = _s3_major * 10 + _s3_minor
+        if _s3_arch >= 120:
+            logger.info(f"sageattn3 FP4 (sageattn3_blackwell) — SM{_s3_arch}")
+        else:
+            logger.info(f"sageattn3_blackwell — SM{_s3_arch}, FP8 fallback")
+except (ImportError, AttributeError) as _e:
+    logger.debug(f"sageattn3 not available: {_e}")
+
+# ── Dynamic mode list — only shows what GPU actually supports ──────────────
+_ATTN_MODES = ["auto", "pytorch", "sdpa", "flash_attn"]
+if _HAS_SAGE_ATTN:
+    _ATTN_MODES.append("sageattn")
+if _HAS_SAGE_ATTN_FP8:
+    _ATTN_MODES.append("sageattn_fp8")
+if _HAS_SAGE_ATTN3:
+    _ATTN_MODES.append("sageattn3")
+
+# Resolve what "auto" actually picks at startup
+_AUTO_DEFAULT_ATTN = "sdpa"  # safe baseline
+if torch.cuda.is_available():
+    _ad_major, _ad_minor = torch.cuda.get_device_capability()
+    _ad_arch = _ad_major * 10 + _ad_minor
+    if _ad_arch >= 120 and _HAS_SAGE_ATTN3:
+        _AUTO_DEFAULT_ATTN = "sageattn3"    # Blackwell → FP4
+    elif _ad_arch >= 80 and _HAS_SAGE_ATTN_FP8:
+        _AUTO_DEFAULT_ATTN = "sageattn_fp8" # Ampere/Ada/Hopper → FP8
+    elif _HAS_SAGE_ATTN:
+        _AUTO_DEFAULT_ATTN = "sageattn"     # SageAttention FP16
+    elif _HAS_FLASH_ATTN:
+        _AUTO_DEFAULT_ATTN = "flash_attn"
+logger.info(f"attention_mode=auto will use: {_AUTO_DEFAULT_ATTN}")
 
 _sam_original_attn_forward = None
 _current_attn_mode = "pytorch"
@@ -106,6 +166,88 @@ def _make_sageattn_forward():
         return x
     return sage_forward
 
+
+def _is_pow2(n: int) -> bool:
+    """sageattn FP8/FP4 kernels require power-of-2 head_dim."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _make_sageattn_fp8_forward():
+    """INT8 QK + FP8 PV kernel — ~2-3x faster on Ampere+.
+    head_dim must be power-of-2; fallback to SDPA otherwise."""
+    from segment_anything.modeling.image_encoder import add_decomposed_rel_pos
+
+    def sage_fp8_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = x.shape
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        head_dim = q.shape[-1]
+        if not _is_pow2(head_dim):
+            # e.g. SAM ViT-H head_dim=80 → SDPA fallback
+            q_for_bias = q.reshape(B * self.num_heads, H * W, head_dim)
+            if self.use_rel_pos:
+                attn_bias = torch.zeros(B * self.num_heads, H * W, H * W, dtype=q.dtype, device=q.device)
+                attn_bias = add_decomposed_rel_pos(attn_bias, q_for_bias, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+                attn_bias = attn_bias.view(B, self.num_heads, H * W, H * W)
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v)
+            return x.transpose(1, 2).reshape(B, H, W, -1)
+        if self.use_rel_pos:
+            q_flat = q.reshape(B * self.num_heads, H * W, -1)
+            k_flat = k.reshape(B * self.num_heads, H * W, -1)
+            v_flat = v.reshape(B * self.num_heads, H * W, -1)
+            attn = (q_flat * self.scale) @ k_flat.transpose(-2, -1)
+            attn = add_decomposed_rel_pos(attn, q_flat, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            attn = attn.softmax(dim=-1)
+            x = (attn @ v_flat).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        else:
+            out = _sage_fp8_kernel(q.contiguous(), k.contiguous(), v.contiguous(),
+                                   tensor_layout="HND", is_causal=False,
+                                   qk_quant_gran="per_warp", pv_accum_dtype="fp32+fp32")
+            x = out[0] if isinstance(out, tuple) else out
+            x = x.transpose(1, 2).reshape(B, H, W, -1)
+        x = self.proj(x)
+        return x
+    return sage_fp8_forward
+
+
+def _make_sageattn3_forward():
+    """sageattn3_blackwell — FP4 native on SM120+, FP8 fallback on older.
+    Supports attn_mask natively so rel_pos blocks use kernel directly.
+    head_dim must be power-of-2; fallback to SDPA otherwise."""
+    from segment_anything.modeling.image_encoder import add_decomposed_rel_pos
+
+    def sage3_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, _ = x.shape
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        head_dim = q.shape[-1]
+        if not _is_pow2(head_dim):
+            # e.g. SAM ViT-H head_dim=80 → SDPA fallback
+            if self.use_rel_pos:
+                q_for_bias = q.reshape(B * self.num_heads, H * W, head_dim)
+                attn_bias = torch.zeros(B * self.num_heads, H * W, H * W, dtype=q.dtype, device=q.device)
+                attn_bias = add_decomposed_rel_pos(attn_bias, q_for_bias, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+                attn_bias = attn_bias.view(B, self.num_heads, H * W, H * W)
+                x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v)
+            return x.transpose(1, 2).reshape(B, H, W, -1)
+        if self.use_rel_pos:
+            q_for_bias = q.reshape(B * self.num_heads, H * W, head_dim)
+            attn_bias = torch.zeros(B * self.num_heads, H * W, H * W, dtype=q.dtype, device=q.device)
+            attn_bias = add_decomposed_rel_pos(attn_bias, q_for_bias, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            attn_bias = attn_bias.view(B, self.num_heads, H * W, H * W)
+            x = _sageattn3_func(q, k, v, attn_mask=attn_bias, is_causal=False)
+        else:
+            x = _sageattn3_func(q, k, v, is_causal=False)
+        x = x.transpose(1, 2).reshape(B, H, W, -1)
+        x = self.proj(x)
+        return x
+    return sage3_forward
+
+
 def _make_flash_attn_forward():
     """Create Flash Attention forward using flash-attn package directly.
     flash_attn_func expects (B, seq_len, num_heads, head_dim) format.
@@ -148,19 +290,26 @@ def enable_optimized_attention(mode="sdpa"):
         from segment_anything.modeling.image_encoder import Attention as SAMAttention
         if _sam_original_attn_forward is None:
             _sam_original_attn_forward = SAMAttention.forward
-        
         if mode == "sdpa":
             SAMAttention.forward = _make_sdpa_attn_forward()
             _current_attn_mode = "sdpa"
-            logger.info("SDPA enabled for SAM ViT (auto Flash/MemEfficient)")
+            logger.info("SDPA enabled for SAM ViT")
         elif mode == "flash_attn":
             SAMAttention.forward = _make_flash_attn_forward()
             _current_attn_mode = "flash_attn"
-            logger.info("Flash Attention enabled for SAM ViT (direct flash-attn package)")
+            logger.info("Flash Attention enabled for SAM ViT")
         elif mode == "sageattn":
             SAMAttention.forward = _make_sageattn_forward()
             _current_attn_mode = "sageattn"
-            logger.info("SageAttention enabled for SAM ViT (non-rel_pos blocks only)")
+            logger.info("SageAttention FP16 PV enabled for SAM ViT")
+        elif mode == "sageattn_fp8":
+            SAMAttention.forward = _make_sageattn_fp8_forward()
+            _current_attn_mode = "sageattn_fp8"
+            logger.info("SageAttention FP8 (INT8 QK + FP8 PV) enabled for SAM ViT")
+        elif mode == "sageattn3":
+            SAMAttention.forward = _make_sageattn3_forward()
+            _current_attn_mode = "sageattn3"
+            logger.info("sageattn3_blackwell (FP4/FP8) enabled for SAM ViT")
     except Exception as e:
         logger.warning(f"Failed to enable {mode} for SAM: {e}")
 
@@ -438,7 +587,7 @@ class GroundingDinoSAMSegment_A100:
                 "threshold": ("FLOAT", {"default": 0.3, "min": 0, "max": 1.0, "step": 0.01}),
                 "batch_size": ("INT", {"default": 32, "min": 1, "max": 128, "step": 1, "tooltip": "Batch size for processing. A100 80GB can handle 32-64."}),
                 "precision": (["bf16", "fp16", "fp32"], {"default": "bf16", "tooltip": "Computation precision. bf16 recommended for A100."}),
-                "attention_mode": (["pytorch", "sdpa", "flash_attn", "sageattn"], {"default": "pytorch", "tooltip": "Attention backend for SAM ViT. sdpa=auto Flash/MemEfficient, flash_attn=direct flash-attn package, sageattn=SageAttention."}),
+                "attention_mode": (_ATTN_MODES, {"default": "auto", "tooltip": "auto=picks fastest available on your GPU. sageattn3=FP4 Blackwell (fastest). sageattn_fp8=INT8 QK+FP8 PV Ampere+. sageattn=FP16 PV. sdpa=PyTorch auto. Only supported options shown."}),
                 "expand": ("INT", {"default": 0, "min": -512, "max": 512, "step": 1, "tooltip": "Grow Mask: expand (positive) or shrink (negative) the mask by pixels."}),
                 "tapered_corners": ("BOOLEAN", {"default": True, "tooltip": "Grow Mask: if True, corners are tapered (rounded). If False, corners are square."}),
                 "block_size": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1, "tooltip": "Blockify Mask: size of blocks in pixels. 0 = disabled (use original mask). Must be >= 1 to blockify."}),
@@ -529,14 +678,26 @@ class GroundingDinoSAMSegment_A100:
             return (image, black_mask, "0")
 
         # Enable/disable optimized attention based on widget
-        if attention_mode in ("sdpa", "flash_attn", "sageattn"):
-            actual_mode = attention_mode
-            if attention_mode == "sageattn" and not _HAS_SAGE_ATTN:
-                logger.warning("SageAttention not installed. pip install sageattention. Falling back to sdpa.")
+        # Resolve "auto" to best available mode
+        effective_attn = attention_mode
+        if attention_mode == "auto":
+            effective_attn = _AUTO_DEFAULT_ATTN
+            logger.info(f"attention_mode=auto resolved to: {effective_attn}")
+
+        if effective_attn in ("sdpa", "flash_attn", "sageattn", "sageattn_fp8", "sageattn3"):
+            actual_mode = effective_attn
+            if effective_attn == "sageattn" and not _HAS_SAGE_ATTN:
+                logger.warning("SageAttention not installed. Falling back to sdpa.")
                 actual_mode = "sdpa"
-            elif attention_mode == "flash_attn" and not _HAS_FLASH_ATTN:
-                logger.warning("flash-attn not installed. pip install flash-attn. Falling back to sdpa.")
+            elif effective_attn == "flash_attn" and not _HAS_FLASH_ATTN:
+                logger.warning("flash-attn not installed. Falling back to sdpa.")
                 actual_mode = "sdpa"
+            elif effective_attn == "sageattn_fp8" and not _HAS_SAGE_ATTN_FP8:
+                logger.warning("SageAttention FP8 not available. Falling back.")
+                actual_mode = "sageattn" if _HAS_SAGE_ATTN else "sdpa"
+            elif effective_attn == "sageattn3" and not _HAS_SAGE_ATTN3:
+                logger.warning("sageattn3 not available. pip install sageattn3. Falling back.")
+                actual_mode = "sageattn_fp8" if _HAS_SAGE_ATTN_FP8 else ("sageattn" if _HAS_SAGE_ATTN else "sdpa")
             enable_optimized_attention(actual_mode)
         else:
             disable_optimized_attention()
@@ -636,7 +797,7 @@ class GroundingDinoSAMSegment_A100:
                     res_images.append(image[j].unsqueeze(0))
                 i = end_idx
         elapsed = time.time() - start_time
-        if attention_mode in ("sdpa", "flash_attn", "sageattn"):
+        if attention_mode in ("auto", "sdpa", "flash_attn", "sageattn", "sageattn_fp8", "sageattn3"):
             disable_optimized_attention()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
