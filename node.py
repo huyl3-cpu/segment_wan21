@@ -69,18 +69,18 @@ _HAS_SAGE_ATTN3 = False
 _sageattn3_func = None
 
 try:
-    from sageattn3 import sageattn as _sageattn3_import
+    from sageattn3 import sageattn3_blackwell as _sageattn3_import
     _sageattn3_func = _sageattn3_import
     _HAS_SAGE_ATTN3 = True
     if torch.cuda.is_available():
         _s3_major, _s3_minor = torch.cuda.get_device_capability()
         _s3_arch = _s3_major * 10 + _s3_minor
         if _s3_arch >= 120:
-            logger.info(f"sageattn3 FP4 available — Blackwell SM{_s3_arch}")
+            logger.info(f"sageattn3 FP4 (sageattn3_blackwell) available — SM{_s3_arch}")
         else:
-            logger.info(f"sageattn3 imported — SM{_s3_arch}, using FP8 fallback path")
-except ImportError:
-    pass
+            logger.info(f"sageattn3_blackwell imported — SM{_s3_arch}, FP8 fallback path")
+except (ImportError, AttributeError) as e:
+    logger.debug(f"sageattn3 not available: {e}")
 
 # ── Dynamic attention mode list (only shows options GPU actually supports) ──────
 _ATTN_MODES = ["pytorch", "sdpa", "flash_attn"]
@@ -207,8 +207,9 @@ def _make_sageattn_fp8_forward():
 
 
 def _make_sageattn3_forward():
-    """sageattn3 forward — FP4 native trên Blackwell SM120+, FP8 fallback trên GPU cũ.
-    rel_pos blocks fallback to naive."""
+    """sageattn3_blackwell forward — FP4 native trên Blackwell SM120+.
+    Khác sageattn thông thường: hỗ trợ attn_mask nên rel_pos blocks
+    có thể dùng kernel trực tiếp thay vì naive fallback."""
     from segment_anything.modeling.image_encoder import add_decomposed_rel_pos
 
     def sage3_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -217,19 +218,22 @@ def _make_sageattn3_forward():
         q, k, v = qkv.unbind(0)
 
         if self.use_rel_pos:
-            # sageattn3 cũng không hỗ trợ attn_bias → naive fallback
-            q_flat = q.reshape(B * self.num_heads, H * W, -1)
-            k_flat = k.reshape(B * self.num_heads, H * W, -1)
-            v_flat = v.reshape(B * self.num_heads, H * W, -1)
-            attn = (q_flat * self.scale) @ k_flat.transpose(-2, -1)
-            attn = add_decomposed_rel_pos(attn, q_flat, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
-            attn = attn.softmax(dim=-1)
-            x = (attn @ v_flat).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+            # sageattn3_blackwell hỗ trợ attn_mask → dùng kernel với rel_pos bias
+            head_dim = q.shape[-1]
+            q_for_bias = q.reshape(B * self.num_heads, H * W, head_dim)
+            attn_bias = torch.zeros(B * self.num_heads, H * W, H * W,
+                                    dtype=q.dtype, device=q.device)
+            attn_bias = add_decomposed_rel_pos(attn_bias, q_for_bias,
+                                               self.rel_pos_h, self.rel_pos_w,
+                                               (H, W), (H, W))
+            # Reshape to (B, num_heads, H*W, H*W) for sageattn3_blackwell
+            attn_bias = attn_bias.view(B, self.num_heads, H * W, H * W)
+            x = _sageattn3_func(q, k, v, attn_mask=attn_bias, is_causal=False)
         else:
-            # sageattn3 tự chọn FP4 (Blackwell) hoặc FP8 (GPU cũ hơn)
+            # sageattn3_blackwell tự chọn FP4 (SM120+) hoặc FP8 (GPU cũ hơn)
             x = _sageattn3_func(q, k, v, is_causal=False)
-            x = x.transpose(1, 2).reshape(B, H, W, -1)
 
+        x = x.transpose(1, 2).reshape(B, H, W, -1)
         x = self.proj(x)
         return x
 
