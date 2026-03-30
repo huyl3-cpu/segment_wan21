@@ -441,7 +441,7 @@ class GroundingDinoSAMSegment_A100:
                 "attention_mode": (["pytorch", "sdpa", "flash_attn", "sageattn"], {"default": "pytorch", "tooltip": "Attention backend for SAM ViT. sdpa=auto Flash/MemEfficient, flash_attn=direct flash-attn package, sageattn=SageAttention."}),
                 "expand": ("INT", {"default": 0, "min": -512, "max": 512, "step": 1, "tooltip": "Grow Mask: expand (positive) or shrink (negative) the mask by pixels."}),
                 "tapered_corners": ("BOOLEAN", {"default": True, "tooltip": "Grow Mask: if True, corners are tapered (rounded). If False, corners are square."}),
-                "block_size": ("INT", {"default": 32, "min": 8, "max": 512, "step": 1, "tooltip": "Blockify Mask: size of blocks in pixels."}),
+                "block_size": ("INT", {"default": 32, "min": 0, "max": 512, "step": 1, "tooltip": "Blockify Mask: size of blocks in pixels. 0 = disabled (use original mask). Must be >= 1 to blockify."}),
                 "blockify_device": (["cpu", "gpu"], {"default": "gpu", "tooltip": "Blockify Mask: device to use for processing."}),
                 "enable_active": ("BOOLEAN", {"default": True, "tooltip": "If True, runs segmentation normally. If False, outputs original image + black mask + '0'."}),
             },
@@ -481,6 +481,9 @@ class GroundingDinoSAMSegment_A100:
 
     @staticmethod
     def _apply_blockify_mask(mask_tensor, block_size, device_str="gpu"):
+        # block_size=0 means disabled — return original mask unchanged
+        if block_size <= 0:
+            return mask_tensor
         processing_device = comfy.model_management.get_torch_device() if device_str == "gpu" else torch.device("cpu")
         masks = mask_tensor.to(processing_device)
         if masks.ndim == 2:
