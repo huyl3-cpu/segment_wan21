@@ -469,9 +469,18 @@ groundingdino_model_list = {
     },
 }
 def get_bert_base_uncased_model_path():
+    # 1. Check ComfyUI models dir
     comfy_bert_model_base = os.path.join(folder_paths.models_dir, 'bert-base-uncased')
     if glob.glob(os.path.join(comfy_bert_model_base, '**/model.safetensors'), recursive=True):
         return comfy_bert_model_base
+    # 2. Check HuggingFace hub cache (avoids network requests on subsequent loads)
+    hf_cache_root = os.environ.get('HF_HOME', os.path.join(os.path.expanduser('~'), '.cache', 'huggingface', 'hub'))
+    for hf_name in ('models--google-bert--bert-base-uncased', 'models--bert-base-uncased'):
+        snapshots = glob.glob(os.path.join(hf_cache_root, hf_name, 'snapshots', '*'))
+        if snapshots:
+            logger.info(f"bert-base-uncased found in HF cache: {snapshots[0]}")
+            return snapshots[0]
+    # 3. Fallback: download from HuggingFace (first run only)
     return 'bert-base-uncased'
 def list_sam_model(): return list(sam_model_list.keys())
 def list_groundingdino_model(): return list(groundingdino_model_list.keys())
@@ -488,6 +497,10 @@ def get_local_filepath(url, dirname, local_file_name=None):
         download_url_to_file(url, destination)
     return destination
 def load_sam_model(model_name):
+    cache_key = f"sam__{model_name}"
+    if cache_key in _session_cache:
+        logger.debug(f"SAM model '{model_name}' loaded from session cache")
+        return _session_cache[cache_key]
     sam_checkpoint_path = get_local_filepath(sam_model_list[model_name]["model_url"], sam_model_dir_name)
     model_file_name = os.path.basename(sam_checkpoint_path)
     model_type = model_file_name.split('.')[0]
@@ -497,8 +510,14 @@ def load_sam_model(model_name):
     sam.to(device=comfy.model_management.get_torch_device())
     sam.eval()
     sam.model_name = model_file_name
+    _session_cache[cache_key] = sam
+    logger.info(f"SAM model '{model_name}' loaded and cached for this session")
     return sam
 def load_groundingdino_model(model_name):
+    cache_key = f"dino__{model_name}"
+    if cache_key in _session_cache:
+        logger.debug(f"GroundingDINO model '{model_name}' loaded from session cache")
+        return _session_cache[cache_key]
     dino_model_args = local_groundingdino_SLConfig.fromfile(
         get_local_filepath(groundingdino_model_list[model_name]["config_url"], groundingdino_model_dir_name)
     )
@@ -509,6 +528,8 @@ def load_groundingdino_model(model_name):
     dino.load_state_dict(local_groundingdino_clean_state_dict(checkpoint['model']), strict=False)
     dino.to(device=comfy.model_management.get_torch_device())
     dino.eval()
+    _session_cache[cache_key] = dino
+    logger.info(f"GroundingDINO model '{model_name}' loaded and cached for this session")
     return dino
 def groundingdino_predict_batch(dino_model, image_pil_list, prompt, threshold, dtype=torch.float32):
     transform = T.Compose([
